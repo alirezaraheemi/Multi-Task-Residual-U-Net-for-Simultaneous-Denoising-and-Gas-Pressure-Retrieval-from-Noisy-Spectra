@@ -1,0 +1,208 @@
+import os, json, numpy as np, pandas as pd
+import torch, torch.nn as nn
+from sklearn.model_selection import GroupKFold
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+# ---------------- CONFIG ----------------
+BASE_DIR = #inputaddress
+LABELS_CSV = os.path.join(BASE_DIR, "labels.csv")
+MODEL_PATH_COMBINED = r"D:\" #address and name ofthe model for example D:\unifuedmodel.pth
+LOG_DIR = r"D:\runs_combined" # input address for saving the runes
+
+os.makedirs(os.path.dirname(MODEL_PATH_COMBINED), exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+BATCH_SIZE = 32
+EPOCHS = 80
+LR = 3e-4
+BASE_CHANNELS = 64
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CLIP_NORM = 2.0
+WEIGHT_DECAY = 1e-4
+PRESSURE_WEIGHT = 0.2  # loss weight between denoise and pressure
+
+# ---------------- Helpers ----------------
+def load_xy_from_path(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".csv", ".txt"]:
+        arr = np.loadtxt(path, delimiter=",")
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 2)
+        return arr[:,0].astype(np.float32), arr[:,1].astype(np.float32)
+    elif ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(path, header=None).dropna(how="all")
+        return df.iloc[:,0].to_numpy(np.float32), df.iloc[:,1].to_numpy(np.float32)
+    else:
+        raise ValueError(f"Unsupported extension: {ext}")
+
+def psnr(mse_loss):
+    if mse_loss == 0:
+        return 100
+    return 10 * np.log10(1.0 / mse_loss)
+
+# ---------------- Dataset ----------------
+class VoigtDataset(Dataset):
+    def __init__(self, base_dir, rows, augment=False):
+        self.base_dir, self.rows, self.augment = base_dir, rows.reset_index(drop=True), augment
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, idx):
+        r = self.rows.iloc[idx]
+        x_noisy, y_noisy = load_xy_from_path(os.path.join(self.base_dir, r["file_path"]))
+        _, y_clean = load_xy_from_path(os.path.join(self.base_dir, r["clean_file_path"]))
+        pressure = np.float32(r["pressure"])
+
+        if self.augment:
+            noise_types = [
+                np.random.normal(0, 0.01, y_noisy.shape),
+                np.random.uniform(-0.01, 0.01, y_noisy.shape),
+                np.random.normal(0, 0.005, y_noisy.shape) * np.sin(np.arange(y_noisy.size) / 10)
+            ]
+            y_noisy += noise_types[np.random.randint(len(noise_types))].astype(np.float32)
+
+        x_norm = (x_noisy - x_noisy.mean()) / (x_noisy.std() + 1e-8)
+        inp = np.stack([y_noisy, x_norm], axis=0).astype(np.float32)
+        return torch.from_numpy(inp), torch.from_numpy(y_clean.astype(np.float32)), torch.tensor(pressure)
+
+# ---------------- Model ----------------
+class UNet1D_DenoisePressure(nn.Module):
+    def __init__(self, in_ch=2, base=64):
+        super().__init__()
+        # Encoder
+        self.enc1 = nn.Sequential(nn.Conv1d(in_ch, base, 3, padding=1), nn.ReLU())
+        self.enc2 = nn.Sequential(nn.Conv1d(base, base*2, 3, padding=1), nn.ReLU())
+        self.enc3 = nn.Sequential(nn.Conv1d(base*2, base*4, 3, padding=1), nn.ReLU())
+        self.pool = nn.MaxPool1d(2)
+        # Bottleneck
+        self.bottleneck = nn.Sequential(nn.Conv1d(base*4, base*8, 3, padding=1), nn.ReLU())
+        # Decoder
+        self.up3 = nn.ConvTranspose1d(base*8, base*4, 2, stride=2)
+        self.dec3 = nn.Sequential(nn.Conv1d(base*8, base*4, 3, padding=1), nn.ReLU())
+        self.up2 = nn.ConvTranspose1d(base*4, base*2, 2, stride=2)
+        self.dec2 = nn.Sequential(nn.Conv1d(base*4, base*2, 3, padding=1), nn.ReLU())
+        self.up1 = nn.ConvTranspose1d(base*2, base, 2, stride=2)
+        self.dec1 = nn.Sequential(nn.Conv1d(base*2, base, 3, padding=1), nn.ReLU())
+        self.out_signal = nn.Conv1d(base, 1, 1)
+        # Pressure head
+        self.pressure_head = nn.Sequential(
+            nn.Conv1d(1, base, 5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(base, base//2),
+            nn.ReLU(),
+            nn.Linear(base//2, 1)
+        )
+
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        b = self.bottleneck(self.pool(e3))
+        # Decoder path for denoise
+        d3 = self.up3(b); d3 = torch.cat([d3, e3], dim=1); d3 = self.dec3(d3)
+        d2 = self.up2(d3); d2 = torch.cat([d2, e2], dim=1); d2 = self.dec2(d2)
+        d1 = self.up1(d2); d1 = torch.cat([d1, e1], dim=1); d1 = self.dec1(d1)
+
+        denoised = self.out_signal(d1)
+
+        # Pressure prediction from denoised signal
+        pressure_pred = self.pressure_head(denoised)
+
+        denoised = denoised.squeeze(1)
+
+        return denoised, pressure_pred.squeeze(1)
+
+
+# ---------------- Training loop ----------------
+def train_combined(train_loader, val_loader, writer):
+    model = UNet1D_DenoisePressure(in_ch=2, base=BASE_CHANNELS).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
+    loss_mse = nn.MSELoss()
+    best_val = float("inf")
+    patience_counter = 0
+    PATIENCE = 7
+
+    for epoch in range(EPOCHS):
+        model.train(); train_loss = 0
+        for inp, clean, pressure in train_loader:
+            inp, clean, pressure = inp.to(DEVICE), clean.to(DEVICE), pressure.to(DEVICE)
+            opt.zero_grad()
+            recon, p_pred = model(inp)
+            loss_denoise = loss_mse(recon, clean)
+            loss_press = loss_mse(p_pred, pressure)
+            loss = loss_denoise + PRESSURE_WEIGHT * loss_press
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+            opt.step()
+            train_loss += loss.item() * inp.size(0)
+        train_loss /= len(train_loader.dataset)
+
+        model.eval(); val_loss = 0
+        with torch.no_grad():
+            for inp, clean, pressure in val_loader:
+                inp, clean, pressure = inp.to(DEVICE), clean.to(DEVICE), pressure.to(DEVICE)
+                recon, p_pred = model(inp)
+                loss_denoise = loss_mse(recon, clean)
+                loss_press = loss_mse(p_pred, pressure)
+                loss = loss_denoise + PRESSURE_WEIGHT * loss_press
+                val_loss += loss.item() * inp.size(0)
+        val_loss /= len(val_loader.dataset)
+        scheduler.step(val_loss)
+
+        writer.add_scalars("Combined/Loss", {"train": train_loss, "val": val_loss}, epoch)
+        writer.add_scalar("Combined/PSNR", psnr(val_loss), epoch)
+        writer.add_scalar("Combined/LR", scheduler.optimizer.param_groups[0]['lr'], epoch)
+        print(f"[Combined] Epoch {epoch+1} | Train: {train_loss:.6f} | Val: {val_loss:.6f} | PSNR: {psnr(val_loss):.2f}dB")
+
+        if val_loss < best_val:
+            best_val = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), MODEL_PATH_COMBINED)
+            print("  -> Saved best combined model")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping after {PATIENCE} epochs without improvement.")
+                break
+
+
+if __name__ == "__main__":
+    
+    df = pd.read_csv(LABELS_CSV)
+    noisy = df[df["type"] == "noisy"].dropna(subset=["clean_file_path"]).reset_index(drop=True)
+
+    k = 3
+    kf = GroupKFold(n_splits=k)
+    groups = noisy["pressure"]
+
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(noisy, groups=groups)):
+    
+
+        print(f"\n========== Fold {fold+1}/{k} ==========")
+
+        train_df = noisy.iloc[train_idx]
+        val_df = noisy.iloc[val_idx]
+
+        writer = SummaryWriter(os.path.join(LOG_DIR, f"fold_{fold+1}"))
+
+        train_loader = DataLoader(
+            VoigtDataset(BASE_DIR, train_df, augment=True),
+            batch_size=BATCH_SIZE,
+            shuffle=True
+        )
+
+        val_loader = DataLoader(
+            VoigtDataset(BASE_DIR, val_df),
+            batch_size=BATCH_SIZE,
+            shuffle=False
+        )
+
+        train_combined(train_loader, val_loader, writer)
+
+        writer.close()
+
