@@ -1,0 +1,126 @@
+import os
+import numpy as np
+import pandas as pd
+from scipy.special import wofz
+
+# --- parameters based on HITRAN data base informations ---
+pressure_bar_to_atm = 0.986923
+center_wavenumber_base = 2055.400364
+gamma_self = 0.053
+sigma_nu_tilde = 0.00485 / (2 * np.sqrt(2 * np.log(2)))
+num_points = 1000
+profile_range = (-0.8, 0.8)    
+noise_range = (-0.8, 0.8)     
+N_PRESSURES = 2000
+alpha = 0.8              
+
+# --- output-dir ---
+base_dir = #input-direction
+folders = {name: os.path.join(base_dir, name) for name in ["clean", "noise1", "noise2", "noise3", "noise4"]}  #Exprimental noise adding
+for f in folders.values():
+    os.makedirs(f, exist_ok=True)
+
+# --- Exp noise address ---
+noise_files = [os.path.join(base_dir, f"noise{i}.xlsx") for i in range(1, 5)]
+
+# --- Voigt func ---
+def voigt_profile(x, sigma, gamma):
+    z = (x + 1j * gamma) / (sigma * np.sqrt(2))
+    return np.real(wofz(z)) / (sigma * np.sqrt(2 * np.pi))
+
+def generate_voigt(center_wn, gamma_self, pressure_bar,
+                   scale_aug=1.0, shift_aug=0.0,
+                   output_range=None):
+    
+    pressure_atm = pressure_bar * pressure_bar_to_atm
+    gamma_nu_tilde = gamma_self * pressure_atm
+
+    
+    x_phys = np.linspace(profile_range[0], profile_range[1], num_points)
+    profile = voigt_profile(x_phys, sigma_nu_tilde, gamma_nu_tilde)
+    intensity_phys = (1 - pressure_bar * profile) * scale_aug
+    intensity_phys = (intensity_phys - intensity_phys.min()) / (intensity_phys.max() - intensity_phys.min())
+
+    
+    if output_range is None:
+        output_range = profile_range
+    x_out = np.linspace(output_range[0], output_range[1], num_points) + shift_aug
+
+    y_out = np.full_like(x_out, 1.0)
+    mask_phys = (x_out >= profile_range[0]) & (x_out <= profile_range[1])
+    y_out[mask_phys] = np.interp(x_out[mask_phys], x_phys, intensity_phys)
+
+    return x_out + center_wn, y_out, gamma_nu_tilde
+
+noise_data = []
+for nf in noise_files:
+    df = pd.read_excel(nf, header=None).dropna(how='all')
+    col = df.iloc[:, 1] if df.shape[1] >= 2 else df.iloc[:, 0]
+    noise = col.astype(float).values
+    noise -= np.mean(noise)
+    if len(noise) != num_points:
+        raise ValueError(f"طول نویز {nf} برابر {len(noise)} است و باید {num_points} باشد.")
+    noise_data.append(noise)
+
+# --- Pressure Gen ---
+pressures_bar = np.linspace(0.01, 2.0, N_PRESSURES)
+np.random.shuffle(pressures_bar)
+
+# --- meta data gen ---
+meta_records = []
+for pressure in pressures_bar:
+    center_wavenumber = center_wavenumber_base + np.random.uniform(-0.005, 0.005)
+    shift_aug = np.random.uniform(-0.01, 0.01)
+    scale_aug = np.random.uniform(0.8, 1.2)
+
+    
+    wn_clean, clean_small, gamma_val = generate_voigt(
+        center_wavenumber, gamma_self, pressure,
+        scale_aug=scale_aug, shift_aug=shift_aug,
+        output_range=profile_range
+    )
+    fname_clean = f'P_{pressure:.4f}_clean.csv'
+    rel_clean = os.path.relpath(os.path.join(folders["clean"], fname_clean), base_dir)
+    np.savetxt(os.path.join(folders["clean"], fname_clean),
+               np.column_stack((wn_clean, clean_small)),
+               delimiter=',', fmt='%.8f')
+
+    meta_records.append({
+        "file_path": rel_clean, "pressure": pressure,
+        "noise_id": 0, "noise_name": "clean", "type": "clean",
+        "center_wn": center_wavenumber, "sigma": sigma_nu_tilde, "gamma": gamma_val,
+        "snr": None, "clean_file_path": rel_clean,
+        "shift_aug": shift_aug, "scale_aug": scale_aug
+    })
+    #--combination with noise--
+    wn_noise, clean_large, _ = generate_voigt(
+        center_wavenumber, gamma_self, pressure,
+        scale_aug=scale_aug, shift_aug=shift_aug,
+        output_range=noise_range
+    )
+
+    for i, noise_vec in enumerate(noise_data, 1):
+        noisy_intensity = noise_vec + alpha * (clean_large - 1.0)
+
+        signal_component = alpha * (clean_large - 1.0)
+        snr_val = np.sqrt(np.mean(signal_component**2)) / np.sqrt(np.mean(noise_vec**2))
+
+        fname_noisy = f'P_{pressure:.4f}_noise{i}.csv'
+        rel_noisy = os.path.relpath(os.path.join(folders[f"noise{i}"], fname_noisy), base_dir)
+        np.savetxt(os.path.join(folders[f"noise{i}"], fname_noisy),
+                   np.column_stack((wn_noise, noisy_intensity)),
+                   delimiter=',', fmt='%.8f')
+
+        meta_records.append({
+            "file_path": rel_noisy, "pressure": pressure,
+            "noise_id": i, "noise_name": f"noise{i}", "type": "noisy",
+            "center_wn": center_wavenumber, "sigma": sigma_nu_tilde, "gamma": gamma_val,
+            "snr": snr_val, "clean_file_path": rel_clean,
+            "shift_aug": shift_aug, "scale_aug": scale_aug
+        })
+
+# --- saving meta data ---
+meta_df = pd.DataFrame(meta_records).sort_values(["pressure", "noise_id"])
+meta_df.to_csv(os.path.join(base_dir, "labels.csv"), index=False, encoding='utf-8-sig')
+
+print(f"[INFO] Dataset با α={alpha} و {len(meta_df)} نمونه آماده شد.")
