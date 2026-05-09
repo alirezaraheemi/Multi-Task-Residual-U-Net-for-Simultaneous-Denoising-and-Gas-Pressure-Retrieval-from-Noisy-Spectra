@@ -1,5 +1,4 @@
 import os
-import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -8,12 +7,11 @@ import torch.nn as nn
 # ===================== CONFIG =====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-MODEL_PATH_COMBINED = r"D:\modelname.pth"
-INPUT_FILE = r"D:\spectra-name.csv"
+MODEL_PATH = r"D:\model-name"
+INPUT_FILE = r"D:\file-name"
 OUTPUT_DIR = r"D:\result"
 
 BASE_CHANNELS = 64
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ===================== Helpers =====================
@@ -23,14 +21,14 @@ def load_xy_from_path(path: str):
         arr = np.loadtxt(path, delimiter=",")
         if arr.ndim == 1:
             arr = arr.reshape(-1, 2)
-        return arr[:, 0].astype(np.float32), arr[:, 1].astype(np.float32)
+        return arr[:,0].astype(np.float32), arr[:,1].astype(np.float32)
     elif ext in [".xlsx", ".xls"]:
         df = pd.read_excel(path, header=None).dropna(how="all")
-        return df.iloc[:, 0].to_numpy(np.float32), df.iloc[:, 1].to_numpy(np.float32)
+        return df.iloc[:,0].to_numpy(np.float32), df.iloc[:,1].to_numpy(np.float32)
     else:
-        raise ValueError(f"Unsupported extension: {ext}")
+        raise ValueError("Unsupported file type")
 
-# ===================== Model Definition =====================
+# ===================== Model (based-on-training-code =====================
 class UNet1D_DenoisePressure(nn.Module):
     def __init__(self, in_ch=2, base=64):
         super().__init__()
@@ -39,31 +37,25 @@ class UNet1D_DenoisePressure(nn.Module):
         self.enc2 = nn.Sequential(nn.Conv1d(base, base*2, 3, padding=1), nn.ReLU())
         self.enc3 = nn.Sequential(nn.Conv1d(base*2, base*4, 3, padding=1), nn.ReLU())
         self.pool = nn.MaxPool1d(2)
-
         # Bottleneck
         self.bottleneck = nn.Sequential(nn.Conv1d(base*4, base*8, 3, padding=1), nn.ReLU())
-
         # Decoder
         self.up3 = nn.ConvTranspose1d(base*8, base*4, 2, stride=2)
         self.dec3 = nn.Sequential(nn.Conv1d(base*8, base*4, 3, padding=1), nn.ReLU())
-
         self.up2 = nn.ConvTranspose1d(base*4, base*2, 2, stride=2)
         self.dec2 = nn.Sequential(nn.Conv1d(base*4, base*2, 3, padding=1), nn.ReLU())
-
         self.up1 = nn.ConvTranspose1d(base*2, base, 2, stride=2)
         self.dec1 = nn.Sequential(nn.Conv1d(base*2, base, 3, padding=1), nn.ReLU())
-
         self.out_signal = nn.Conv1d(base, 1, 1)
-
         # Pressure head
         self.pressure_head = nn.Sequential(
             nn.Conv1d(1, base, 5, padding=2),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
-            nn.Linear(base, base // 2),
+            nn.Linear(base, base//2),
             nn.ReLU(),
-            nn.Linear(base // 2, 1)
+            nn.Linear(base//2, 1)
         )
 
     def forward(self, x):
@@ -71,76 +63,65 @@ class UNet1D_DenoisePressure(nn.Module):
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         b = self.bottleneck(self.pool(e3))
-
-        d3 = self.up3(b)
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
-
-        d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
-
-        d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
+        
+        d3 = self.up3(b); d3 = torch.cat([d3, e3], dim=1); d3 = self.dec3(d3)
+        d2 = self.up2(d3); d2 = torch.cat([d2, e2], dim=1); d2 = self.dec2(d2)
+        d1 = self.up1(d2); d1 = torch.cat([d1, e1], dim=1); d1 = self.dec1(d1)
 
         denoised = self.out_signal(d1)
         pressure_pred = self.pressure_head(denoised)
 
-        denoised = denoised.squeeze(1)
-        pressure_pred = pressure_pred.squeeze(1)
-
-        return denoised, pressure_pred
+        return denoised.squeeze(1), pressure_pred.squeeze(1)
 
 # ===================== Load Model =====================
-def load_model(model_path):
+def load_model():
     model = UNet1D_DenoisePressure(in_ch=2, base=BASE_CHANNELS).to(DEVICE)
-    state = torch.load(model_path, map_location=DEVICE)
+    state = torch.load(MODEL_PATH, map_location=DEVICE)
     model.load_state_dict(state)
     model.eval()
     return model
 
-model = load_model(MODEL_PATH_COMBINED)
-
-# ===================== Load Input =====================
-x_raw, y_noisy = load_xy_from_path(INPUT_FILE)
-
-x_norm = (x_raw - x_raw.mean()) / (x_raw.std() + 1e-8)
-inp = np.stack([y_noisy, x_norm], axis=0).astype(np.float32)
-inp_tensor = torch.from_numpy(inp).unsqueeze(0).to(DEVICE)
-
 # ===================== Inference =====================
-with torch.no_grad():
-    y_denoised, pressure_pred = model(inp_tensor)
-    y_denoised = y_denoised.squeeze(0).cpu().numpy()
-    pressure_pred = pressure_pred.item()
+def run_inference(file_path, model):
+    # file-uploading
+    x_raw, y_raw = load_xy_from_path(file_path)
 
-# ===================== Save Denoised Output =====================
-denoised_file = os.path.join(
-    OUTPUT_DIR,
-    os.path.basename(INPUT_FILE).replace(".csv", "_denoised.csv").replace(".txt", "_denoised.csv").replace(".xlsx", "_denoised.csv")
-)
+    # normalization
+    x_norm = (x_raw - x_raw.mean()) / (x_raw.std() + 1e-8)
+    
+    # making-input [y_noisy, x_norm]
+    inp_np = np.stack([y_raw, x_norm], axis=0).astype(np.float32)
+    inp = torch.from_numpy(inp_np).unsqueeze(0).to(DEVICE)  # [1, 2, L]
 
-pd.DataFrame(np.column_stack([x_raw, y_denoised])).to_csv(
-    denoised_file, index=False, header=False
-)
+    # resulting
+    with torch.no_grad():
+        denoised, pressure = model(inp)
 
-print(f"\n✅ Denoised file saved: {denoised_file}")
+    # transfor to numpy
+    den = denoised.cpu().numpy().squeeze()
+    pressure = pressure.cpu().item()
 
-# ===================== Save Pressure Output =====================
-excel_path = os.path.join(OUTPUT_DIR, "predicted_pressures.xlsx")
-new_row = pd.DataFrame(
-    [[os.path.basename(INPUT_FILE), pressure_pred]],
-    columns=["file_name", "predicted_pressure"]
-)
+    # saving denoised
+    den_path = os.path.join(
+        OUTPUT_DIR,
+        os.path.basename(file_path).replace(".csv", "_denoised.csv")
+    )
+    pd.DataFrame(np.column_stack([x_raw, den])).to_csv(den_path, index=False, header=False)
 
-if os.path.exists(excel_path):
-    existing = pd.read_excel(excel_path)
-    df_out = pd.concat([existing, new_row], ignore_index=True)
-else:
-    df_out = new_row
+    # saving pressure 
+    out_xlsx = os.path.join(OUTPUT_DIR, "predicted_pressures.xlsx")
+    row = pd.DataFrame([[os.path.basename(file_path), pressure]], columns=["file", "pred"])
+    if os.path.exists(out_xlsx):
+        full = pd.concat([pd.read_excel(out_xlsx), row], ignore_index=True)
+    else:
+        full = row
+    full.to_excel(out_xlsx, index=False)
 
-df_out.to_excel(excel_path, index=False)
+    print("✓ DONE")
+    print(f"Denoised: {den_path}")
+    print(f"Pressure: {pressure:.4f}")
 
-print(f"✅ Predicted pressure: {pressure_pred:.6f}")
-print(f"📂 Pressure saved to: {excel_path}")
+# ===================== RUN =====================
+if __name__ == "__main__":
+    model = load_model()
+    run_inference(INPUT_FILE, model)
