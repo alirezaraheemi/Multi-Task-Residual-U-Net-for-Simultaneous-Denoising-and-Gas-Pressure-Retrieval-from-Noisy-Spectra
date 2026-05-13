@@ -1,0 +1,172 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.model_selection import train_test_split
+
+# ===================== CONFIG =====================
+EXP_BASE_DIR   = r"youe experimental dataset which has noise on them "
+EXP_LABELS_CSV = os.path.join(EXP_BASE_DIR, "labels_clean.csv")
+
+STAGE1_MODEL   = r"D:\priveouse model (trained on simulation data"
+STAGE2_MODEL   = r"D:\new fine tuned model address"
+LOG_DIR_STAGE2 = r"D:\runs_stage2"
+
+BATCH_SIZE     = 16
+EPOCHS_STAGE2  = 50
+LR_HEAD        = 1e-3   # pressure_head
+LR_DENOISER    = 1e-5   # denoiser —
+BASE_CHANNELS  = 64
+CLIP_NORM      = 2.0
+PATIENCE       = 7
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+os.makedirs(os.path.dirname(STAGE2_MODEL), exist_ok=True)
+os.makedirs(LOG_DIR_STAGE2, exist_ok=True)
+
+# ===================== Helpers =====================
+def load_xy_from_path(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".csv", ".txt"]:
+        arr = np.loadtxt(path, delimiter=",")
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 2)
+        return arr[:, 0].astype(np.float32), arr[:, 1].astype(np.float32)
+    elif ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(path, header=None).dropna(how="all")
+        return df.iloc[:, 0].to_numpy(np.float32), df.iloc[:, 1].to_numpy(np.float32)
+    raise ValueError(f"Unsupported extension: {ext}")
+
+# ===================== Dataset =====================
+class ExpDataset(Dataset):
+    def __init__(self, base_dir, rows):
+        self.base_dir = base_dir
+        self.rows = rows.reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        r = self.rows.iloc[idx]
+        x_raw, y_raw = load_xy_from_path(os.path.join(self.base_dir, r["file_path"]))
+        pressure = np.float32(r["pressure"])
+
+        x_norm = (x_raw - x_raw.mean()) / (x_raw.std() + 1e-8)
+        inp = np.stack([y_raw, x_norm], axis=0)
+
+        return torch.from_numpy(inp), torch.tensor(pressure)
+
+# ===================== Model =====================
+class UNet1D_DenoisePressure(nn.Module):
+    def __init__(self, in_ch=2, base=64):
+        super().__init__()
+        self.enc1       = nn.Sequential(nn.Conv1d(in_ch,  base,   3, padding=1), nn.ReLU())
+        self.enc2       = nn.Sequential(nn.Conv1d(base,   base*2, 3, padding=1), nn.ReLU())
+        self.enc3       = nn.Sequential(nn.Conv1d(base*2, base*4, 3, padding=1), nn.ReLU())
+        self.pool       = nn.MaxPool1d(2)
+        self.bottleneck = nn.Sequential(nn.Conv1d(base*4, base*8, 3, padding=1), nn.ReLU())
+        self.up3        = nn.ConvTranspose1d(base*8, base*4, 2, stride=2)
+        self.dec3       = nn.Sequential(nn.Conv1d(base*8, base*4, 3, padding=1), nn.ReLU())
+        self.up2        = nn.ConvTranspose1d(base*4, base*2, 2, stride=2)
+        self.dec2       = nn.Sequential(nn.Conv1d(base*4, base*2, 3, padding=1), nn.ReLU())
+        self.up1        = nn.ConvTranspose1d(base*2, base,   2, stride=2)
+        self.dec1       = nn.Sequential(nn.Conv1d(base*2, base,   3, padding=1), nn.ReLU())
+        self.out_signal = nn.Conv1d(base, 1, 1)
+
+        self.pressure_head = nn.Sequential(
+            nn.Conv1d(1, base, 5, padding=2), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten(),
+            nn.Linear(base, base // 2), nn.ReLU(),
+            nn.Linear(base // 2, 1),
+            nn.Softplus()
+        )
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        b  = self.bottleneck(self.pool(e3))
+        d3 = self.dec3(torch.cat([self.up3(b),  e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        denoised = self.out_signal(d1)
+        pressure = self.pressure_head(denoised)
+        return denoised.squeeze(1), pressure.squeeze(1)
+
+# ===================== Stage 2 Training =====================
+def train_stage2():
+    print("Loading Stage 1 weights...")
+    model = UNet1D_DenoisePressure(in_ch=2, base=BASE_CHANNELS).to(DEVICE)
+    model.load_state_dict(torch.load(STAGE1_MODEL, map_location=DEVICE))
+
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"Trainable: {trainable:,} / Total: {total:,} ({100*trainable/total:.1f}%)")
+
+    df = pd.read_csv(EXP_LABELS_CSV)
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+
+    train_loader = DataLoader(ExpDataset(EXP_BASE_DIR, train_df),
+                              batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(ExpDataset(EXP_BASE_DIR, val_df),
+                              batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+    denoiser_params = [p for n, p in model.named_parameters() if "pressure_head" not in n]
+    opt = torch.optim.Adam([
+        {"params": model.pressure_head.parameters(), "lr": LR_HEAD},
+        {"params": denoiser_params,                  "lr": LR_DENOISER},
+    ])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
+    loss_fn   = nn.MSELoss()
+    writer    = SummaryWriter(LOG_DIR_STAGE2)
+
+    best_val, patience_counter = float("inf"), 0
+
+    print("\n========== Stage 2: Fine-tuning Pressure Head ==========")
+    for epoch in range(EPOCHS_STAGE2):
+        model.train()
+        train_loss = 0.0
+        for inp, pressure in train_loader:
+            inp, pressure = inp.to(DEVICE), pressure.to(DEVICE)
+            opt.zero_grad()
+            _, p_pred = model(inp)
+            loss = loss_fn(p_pred, pressure)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.pressure_head.parameters(), CLIP_NORM)
+            opt.step()
+            train_loss += loss.item() * inp.size(0)
+        train_loss /= len(train_loader.dataset)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inp, pressure in val_loader:
+                inp, pressure = inp.to(DEVICE), pressure.to(DEVICE)
+                _, p_pred = model(inp)
+                val_loss += loss_fn(p_pred, pressure).item() * inp.size(0)
+        val_loss /= len(val_loader.dataset)
+
+        scheduler.step(val_loss)
+        writer.add_scalars("Stage2/Loss", {"train": train_loss, "val": val_loss}, epoch)
+        writer.add_scalar("Stage2/LR", opt.param_groups[0]["lr"], epoch)
+        print(f"Epoch {epoch+1:3d}/{EPOCHS_STAGE2} | Train: {train_loss:.6f} | Val: {val_loss:.6f}")
+
+        if val_loss < best_val:
+            best_val, patience_counter = val_loss, 0
+            torch.save(model.state_dict(), STAGE2_MODEL)
+            print("  -> Saved best model")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch+1}.")
+                break
+
+    writer.close()
+    print(f"\n✓ Stage 2 complete. Best val loss: {best_val:.6f} | Saved: {STAGE2_MODEL}")
+
+if __name__ == "__main__":
+    train_stage2()
