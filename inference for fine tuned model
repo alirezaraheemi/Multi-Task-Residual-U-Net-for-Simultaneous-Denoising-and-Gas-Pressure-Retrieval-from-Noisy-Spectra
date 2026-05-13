@@ -1,0 +1,119 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+# ===================== CONFIG =====================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_PATH = r"D:\pressure_finetuned.pth"
+INPUT_PATH = r"D:\P_0.2799_noise1.csv"
+OUTPUT_DIR = r"D:\result-exp"
+
+BASE_CHANNELS = 64
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ===================== Helpers =====================
+def load_xy_from_path(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".csv", ".txt"]:
+        arr = np.loadtxt(path, delimiter=",")
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 2)
+        return arr[:, 0].astype(np.float32), arr[:, 1].astype(np.float32)
+    elif ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(path, header=None).dropna(how="all")
+        return df.iloc[:, 0].to_numpy(np.float32), df.iloc[:, 1].to_numpy(np.float32)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+def collect_files(input_path: str):
+    if os.path.isfile(input_path):
+        return [input_path]
+    elif os.path.isdir(input_path):
+        exts = {".csv", ".txt", ".xlsx", ".xls"}
+        return sorted([
+            os.path.join(input_path, f)
+            for f in os.listdir(input_path)
+            if os.path.splitext(f)[1].lower() in exts
+        ])
+    else:
+        raise FileNotFoundError(f"Not found: {input_path}")
+
+# ===================== Model =====================
+class UNet1D_DenoisePressure(nn.Module):
+    def __init__(self, in_ch=2, base=64):
+        super().__init__()
+        self.enc1       = nn.Sequential(nn.Conv1d(in_ch,  base,   3, padding=1), nn.ReLU())
+        self.enc2       = nn.Sequential(nn.Conv1d(base,   base*2, 3, padding=1), nn.ReLU())
+        self.enc3       = nn.Sequential(nn.Conv1d(base*2, base*4, 3, padding=1), nn.ReLU())
+        self.pool       = nn.MaxPool1d(2)
+        self.bottleneck = nn.Sequential(nn.Conv1d(base*4, base*8, 3, padding=1), nn.ReLU())
+        self.up3        = nn.ConvTranspose1d(base*8, base*4, 2, stride=2)
+        self.dec3       = nn.Sequential(nn.Conv1d(base*8, base*4, 3, padding=1), nn.ReLU())
+        self.up2        = nn.ConvTranspose1d(base*4, base*2, 2, stride=2)
+        self.dec2       = nn.Sequential(nn.Conv1d(base*4, base*2, 3, padding=1), nn.ReLU())
+        self.up1        = nn.ConvTranspose1d(base*2, base,   2, stride=2)
+        self.dec1       = nn.Sequential(nn.Conv1d(base*2, base,   3, padding=1), nn.ReLU())
+        self.out_signal = nn.Conv1d(base, 1, 1)
+        self.pressure_head = nn.Sequential(
+            nn.Conv1d(1, base, 5, padding=2), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten(),
+            nn.Linear(base, base // 2), nn.ReLU(),
+            nn.Linear(base // 2, 1),
+            nn.Softplus()
+        )
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        b  = self.bottleneck(self.pool(e3))
+        d3 = self.dec3(torch.cat([self.up3(b),  e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        denoised = self.out_signal(d1)
+        pressure = self.pressure_head(denoised)
+        return denoised.squeeze(1), pressure.squeeze(1)
+
+# ===================== Inference =====================
+def run_inference(file_path: str, model: nn.Module, results: list):
+    x_raw, y_raw = load_xy_from_path(file_path)
+    x_norm = (x_raw - x_raw.mean()) / (x_raw.std() + 1e-8)
+    inp = torch.from_numpy(np.stack([y_raw, x_norm], axis=0)[None]).to(DEVICE)
+
+    with torch.no_grad():
+        denoised, pressure = model(inp)
+
+    den          = denoised.cpu().numpy().squeeze()
+    pressure_val = pressure.cpu().item()
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    den_path  = os.path.join(OUTPUT_DIR, f"{base_name}_denoised.csv")
+    pd.DataFrame(np.column_stack([x_raw, den])).to_csv(den_path, index=False, header=False)
+
+    results.append({"file": os.path.basename(file_path), "pred_pressure": pressure_val})
+    print(f"✓  {os.path.basename(file_path):40s}  →  pressure = {pressure_val:.6f}")
+
+# ===================== RUN =====================
+if __name__ == "__main__":
+    model = UNet1D_DenoisePressure(in_ch=2, base=BASE_CHANNELS).to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model.eval()
+    print(f"Model loaded from: {MODEL_PATH}\n")
+
+    files = collect_files(INPUT_PATH)
+    print(f"Found {len(files)} file(s) to process.\n")
+
+    results = []
+    for fp in files:
+        try:
+            run_inference(fp, model, results)
+        except Exception as e:
+            print(f"✗  {os.path.basename(fp)}: {e}")
+
+    if results:
+        out_xlsx = os.path.join(OUTPUT_DIR, "predicted_pressures.xlsx")
+        pd.DataFrame(results).to_excel(out_xlsx, index=False)
+        print(f"\nResults saved → {out_xlsx}")
